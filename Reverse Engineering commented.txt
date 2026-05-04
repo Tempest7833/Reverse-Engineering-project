@@ -1,0 +1,639 @@
+; CS 4653  –  Reverse Engineering Project  –  Team 13
+; Annotated Assembly Listing
+;
+; Functions covered:
+;   FUN_00409030  –  bit_permute_wrapper
+;   FUN_00409050  –  gf_mix  (XOR key-mixing step)
+;   FUN_004090b0  –  cond_rotate  (conditional bit rotation)
+;   FUN_00409170  –  nibble_step  (nibble swap + XOR)
+;   FUN_00409430  –  bit_permute  (6-bit field scatter)
+;   FUN_00409840  –  load_key  (reads 32-byte key from .enc file)
+;   FUN_004098b0  –  decrypt_one_byte  (orchestrates the full cipher chain)
+;
+; Decrypt pipeline (confirmed from FUN_004098b0 call order):
+;   ciphertext_byte
+;       --> bit_permute   (FUN_00409030 -> FUN_00409430)
+;       --> cond_rotate   (FUN_004090b0)
+;       --> nibble_step   (FUN_00409170)
+;       --> gf_mix        (FUN_00409050)
+;   --> plaintext_byte
+;
+; .enc file layout:
+;   [0  .. 15]      key[0..15]   (first half of 32-byte key)
+;   [16 .. 16+N-1]  ciphertext   (N bytes)
+;   [16+N .. 31+N]  key[16..31]  (second half of 32-byte key)
+;
+; Key source: SHA-256 hash of the input filename string.
+; Key selection per ciphertext byte at position i (0-based):
+;   even i  -> key_schedule[0]    (key[0])
+;   odd  i  -> key_schedule[0x1f] (key[31])
+; =============================================================================
+
+
+; =============================================================================
+; FUN_00409030  –  bit_permute_wrapper
+; -----------------------------------------------------------------------------
+; A thin wrapper that zero-extends param_1 to 32 bits then tail-calls the real
+; bit_permute function (FUN_00409430).  No logic of its own.
+;
+; Signature: byte bit_permute_wrapper(byte param_1)
+; Called by: FUN_004098b0 (decrypt_one_byte) at 004098bf
+; =============================================================================
+                         byte __cdecl FUN_00409030(byte param_1)
+
+        00409030 55           PUSH    EBP
+        00409031 8bec         MOV     EBP, ESP           ; standard prologue
+        00409033 0fb64508     MOVZX   EAX, byte [EBP+param_1]  ; zero-extend input byte into EAX
+        00409037 50           PUSH    EAX                ; pass byte as argument to bit_permute
+        00409038 e8f3030000   CALL    FUN_00409430       ; call the real bit_permute (FUN_00409430)
+        0040903d 83c404       ADD     ESP, 0x4           ; clean up argument from stack
+        00409040 5d           POP     EBP
+        00409041 c3           RET                        ; return bit_permute result (already in AL)
+
+
+; =============================================================================
+; FUN_00409050  –  gf_mix   (final XOR key-mixing step)
+; -----------------------------------------------------------------------------
+; Combines the processed ciphertext byte with one byte from the key schedule
+; using bitwise XOR.  Despite the "GF" name, this is a simple XOR – the only
+; GF(2^8) aspect is that XOR is the GF addition operator.
+;
+; Algorithm:
+;   1. Build an 8-byte lookup table on the stack:
+;        table = {0xa5, 0x5a, 0xc3, 0x7e, 0xac, 0x18, 0x69, 0x59}
+;      (Indices 0-3 are deterministic; indices 4-7 overlap the /GS stack
+;       security cookie and are therefore runtime-dependent.)
+;   2. Index into the table with (key_byte & 7).
+;   3. XOR param_1 with the selected table entry.
+;   4. Return the result.
+;
+; Effective XOR constants for the reference file:
+;   even positions: key[0]=0xef, key[0]&7=7  -> table[7]=0x59  (deterministic)
+;   odd  positions: key[31]=0x3e, key[31]&7=6 -> table[6]=0x69 (deterministic)
+;   NOTE: both indices (6 and 7) fall in the cookie-dependent zone.
+;         Actual runtime values will differ from 0x59 / 0x69 unless ASLR is
+;         disabled.
+;
+; Signature: byte gf_mix(byte param_1, byte param_2)
+;   param_1 = processed ciphertext byte (after bit_permute, cond_rotate, nibble_step)
+;   param_2 = key schedule byte (key[0] or key[31])
+; Called by: FUN_004098b0 at 0040990e (even branch) and 00409930 (odd branch)
+; =============================================================================
+                         byte __cdecl FUN_00409050(byte param_1, byte param_2)
+
+        00409050 55           PUSH    EBP
+        00409051 8bec         MOV     EBP, ESP
+        00409053 83ec0c       SUB     ESP, 0xc           ; allocate 12 bytes of locals
+
+        ; ----- /GS stack cookie setup ----------------------------------------
+        00409056 a180d04500   MOV     EAX, [DAT_0045d080]  ; load global cookie constant = 0xBB40E64E
+        0040905b 33c5         XOR     EAX, EBP             ; cookie_xored = 0xBB40E64E XOR EBP
+        0040905d 8945fc       MOV     [EBP+local_8], EAX   ; save cookie at EBP-8 for later check
+        ; ---------------------------------------------------------------------
+
+        ; ----- Build 8-byte GF lookup table on the stack ---------------------
+        ; Layout: local_10=table[0], local_f=table[1], ..., local_9=table[7]
+        ; i.e., table[n] lives at [EBP - 0x10 + n]  ==>  [EBP - 0xc + (n-4)] for the index
+        ; The access formula below is: [EBP + key&7 - 0xc]
+        ;   key&7=0 -> [EBP-0xc] = local_c = 0xac  (table index 4, NOT table[0]!)
+        ;   key&7=4 -> [EBP-0x8] = local_8 = low byte of cookie_xored  <-- COOKIE DEPENDENT
+        00409060 c645f4a5     MOV     byte [EBP+local_10], 0xa5  ; table[0] = 0xa5
+        00409064 c645f55a     MOV     byte [EBP+local_f],  0x5a  ; table[1] = 0x5a
+        00409068 c645f6c3     MOV     byte [EBP+local_e],  0xc3  ; table[2] = 0xc3
+        0040906c c645f77e     MOV     byte [EBP+local_d],  0x7e  ; table[3] = 0x7e
+        00409070 c645f8ac     MOV     byte [EBP+local_c],  0xac  ; table[4] = 0xac  <- [EBP-0xc], key&7=0
+        00409074 c645f918     MOV     byte [EBP+local_b],  0x18  ; table[5] = 0x18  <- key&7=1
+        00409078 c645fa69     MOV     byte [EBP+local_a],  0x69  ; table[6] = 0x69  <- key&7=2
+        0040907c c645fb59     MOV     byte [EBP+local_9],  0x59  ; table[7] = 0x59  <- key&7=3
+        ; NOTE: key&7 values 4..7 read into local_8..local_5 which is the
+        ;       cookie_xored dword – making those table entries UNPREDICTABLE.
+        ; ---------------------------------------------------------------------
+
+        ; ----- XOR param_1 with table[key_byte & 7] --------------------------
+        00409080 0fb64508     MOVZX   EAX, byte [EBP+param_1]  ; EAX = ciphertext byte
+        00409084 0fb64d0c     MOVZX   ECX, byte [EBP+param_2]  ; ECX = key byte
+        00409088 83e107       AND     ECX, 0x7                  ; ECX = key_byte & 7  (3-bit index)
+        0040908b 0fb6540df4  MOVZX   EDX, byte [EBP+ECX*1-0xc] ; EDX = table[key_byte & 7]
+        00409090 33c2         XOR     EAX, EDX                  ; result = param_1 XOR table[key&7]
+        00409092 884508       MOV     byte [EBP+param_1], AL    ; store result back
+        00409095 0fb64508     MOVZX   EAX, byte [EBP+param_1]  ; move result into return register
+        ; ---------------------------------------------------------------------
+
+        ; ----- /GS cookie check before return --------------------------------
+        00409099 8b4dfc       MOV     ECX, [EBP+local_8]        ; reload saved cookie_xored
+        0040909c 33cd         XOR     ECX, EBP                  ; recover original cookie constant
+        0040909e e8dd0a0000   CALL    __security_check_cookie   ; abort if stack was smashed
+        004090a3 8be5         MOV     ESP, EBP
+        004090a5 5d           POP     EBP
+        004090a6 c3           RET                               ; return XOR result in AL
+
+
+; =============================================================================
+; FUN_004090b0  –  cond_rotate   (conditional bit rotation)
+; -----------------------------------------------------------------------------
+; Rotates param_1 left or right by 1 bit, with the direction chosen by a
+; lookup table indexed by (param_1 & 7).
+;
+; Algorithm:
+;   1. Build an 8-byte direction table on the stack:
+;        ROT_TABLE = {0xFB, 0x1D, 0xA1, 0xD7, 0xB3, 0xE9, 0x2F, 0xC5}
+;      All entries 0-3 are odd (LSB=1).  Entries 4-7 overlap the /GS cookie
+;      and are runtime-dependent.
+;   2. direction = ROT_TABLE[param_1 & 7]  AND  param_2
+;   3. if direction == 1:  ROTR(param_1, 1)   right-rotate by 1
+;      else:               ROTL(param_1, 1)   left-rotate  by 1
+;
+; ROTR formula: result = (x >> 1) | ((x & 1) << 7)
+; ROTL formula: result = (x << 1) | ((x >> 7) & 1)
+;
+; param_2 is always passed as 0x1 from the caller (used as a bitmask).
+; For ROT_TABLE indices 0-3 (all odd), direction always equals 1 -> always ROTR.
+; For indices 4-7 the cookie bytes decide the direction unpredictably.
+;
+; Signature: byte cond_rotate(byte param_1, byte param_2)
+;   param_1 = byte to rotate
+;   param_2 = AND mask (always 0x1 from caller)
+; Called by: FUN_004098b0 at 004098d1
+; =============================================================================
+                         byte __cdecl FUN_004090b0(byte param_1, byte param_2)
+
+        004090b0 55           PUSH    EBP
+        004090b1 8bec         MOV     EBP, ESP
+        004090b3 83ec10       SUB     ESP, 0x10          ; 16 bytes of locals
+
+        ; ----- /GS stack cookie setup ----------------------------------------
+        004090b6 a180d04500   MOV     EAX, [DAT_0045d080]  ; global cookie = 0xBB40E64E
+        004090bb 33c5         XOR     EAX, EBP             ; cookie_xored = cookie XOR EBP
+        004090bd 8945fc       MOV     [EBP+local_8], EAX   ; save for end-of-function check
+        ; ---------------------------------------------------------------------
+
+        ; ----- Build 8-byte rotation-direction table on the stack ------------
+        ; table[n] = ROT_TABLE[n]:  odd value -> ROTR,  even -> ROTL
+        ; Access: [EBP + (param_1&7)*1 - 0xc]
+        ;   param_1&7=0 -> [EBP-0xc] = local_c = 0xb3   odd  -> ROTR
+        ;   param_1&7=1 -> [EBP-0xb] = local_b = 0xe9   odd  -> ROTR
+        ;   param_1&7=2 -> [EBP-0xa] = local_a = 0x2f   odd  -> ROTR
+        ;   param_1&7=3 -> [EBP-0x9] = local_9 = 0xc5   odd  -> ROTR
+        ;   param_1&7=4 -> [EBP-0x8] = local_8 = cookie byte 0  <-- COOKIE DEPENDENT
+        ;   param_1&7=5..7 -> also cookie bytes           <-- COOKIE DEPENDENT
+        004090c0 c645f4fb     MOV     byte [EBP+local_10], 0xfb  ; ROT_TABLE[0] = 0xFB (odd, ROTR)
+        004090c4 c645f51d     MOV     byte [EBP+local_f],  0x1d  ; ROT_TABLE[1] = 0x1D (odd, ROTR)
+        004090c8 c645f6a1     MOV     byte [EBP+local_e],  0xa1  ; ROT_TABLE[2] = 0xA1 (odd, ROTR)
+        004090cc c645f7d7     MOV     byte [EBP+local_d],  0xd7  ; ROT_TABLE[3] = 0xD7 (odd, ROTR)
+        004090d0 c645f8b3     MOV     byte [EBP+local_c],  0xb3  ; ROT_TABLE[4] = 0xB3  <- key&7=0
+        004090d4 c645f9e9     MOV     byte [EBP+local_b],  0xe9  ; ROT_TABLE[5] = 0xE9  <- key&7=1
+        004090d8 c645fa2f     MOV     byte [EBP+local_a],  0x2f  ; ROT_TABLE[6] = 0x2F  <- key&7=2
+        004090dc c645fbc5     MOV     byte [EBP+local_9],  0xc5  ; ROT_TABLE[7] = 0xC5  <- key&7=3
+        ; ---------------------------------------------------------------------
+
+        ; ----- Compute rotation direction ------------------------------------
+        004090e0 0fb64508     MOVZX   EAX, byte [EBP+param_1]     ; EAX = byte to rotate
+        004090e4 83e007       AND     EAX, 0x7                     ; EAX = param_1 & 7  (table index)
+        004090e7 0fb64c05f4  MOVZX   ECX, byte [EBP+EAX*1-0xc]   ; ECX = ROT_TABLE[param_1 & 7]
+        004090ec 0fb6550c     MOVZX   EDX, byte [EBP+param_2]     ; EDX = param_2 (mask, always 0x1)
+        004090f0 23ca         AND     ECX, EDX                     ; direction = ROT_TABLE[i] AND mask
+        004090f2 83f901       CMP     ECX, 0x1                     ; direction == 1?
+        004090f5 752c         JNZ     LAB_00409123                 ; no -> go to ROTL path
+        ; ---------------------------------------------------------------------
+
+        ; ----- ROTR path: result = (x >> 1) | ((x & 1) << 7) ----------------
+        004090f7 0fb64508     MOVZX   EAX, byte [EBP+param_1]  ; EAX = x
+        004090fb 83e001       AND     EAX, 0x1                  ; EAX = x & 1  (save LSB)
+        004090fe 8845f3       MOV     byte [EBP+local_11], AL   ; local_11 = LSB
+        00409101 0fb64df3     MOVZX   ECX, byte [EBP+local_11]  ; ECX = LSB
+        00409105 c1e107       SHL     ECX, 0x7                  ; ECX = LSB << 7  (move to bit 7)
+        00409108 884df3       MOV     byte [EBP+local_11], CL   ; save shifted LSB
+        0040910b 0fb65508     MOVZX   EDX, byte [EBP+param_1]  ; EDX = x
+        0040910f d1fa         SAR     EDX, 0x1                  ; EDX = x >> 1  (arithmetic right shift)
+        00409111 8855f2       MOV     byte [EBP+local_12], DL   ; local_12 = x >> 1
+        00409114 0fb645f2     MOVZX   EAX, byte [EBP+local_12]  ; EAX = x >> 1
+        00409118 0fb64df3     MOVZX   ECX, byte [EBP+local_11]  ; ECX = LSB << 7
+        0040911c 0bc1         OR      EAX, ECX                  ; result = (x>>1) | (LSB<<7)  = ROTR
+        0040911e 8845f2       MOV     byte [EBP+local_12], AL   ; store ROTR result
+        00409121 eb2f         JMP     LAB_00409152               ; jump to return
+        ; ---------------------------------------------------------------------
+
+        ; ----- ROTL path: result = (x << 1) | ((x >> 7) & 1) ----------------
+                         LAB_00409123:                            ; reached when direction != 1
+        00409123 0fb65508     MOVZX   EDX, byte [EBP+param_1]  ; EDX = x
+        00409127 81e280000000 AND     EDX, 0x80                 ; EDX = x & 0x80  (isolate bit 7)
+        0040912d 8855f3       MOV     byte [EBP+local_11], DL   ; local_11 = bit7 field
+        00409130 0fb645f3     MOVZX   EAX, byte [EBP+local_11]  ; EAX = bit7 field
+        00409134 85c0         TEST    EAX, EAX                  ; is bit 7 set?
+        00409136 7404         JZ      LAB_0040913c              ; no -> local_11 stays 0
+        00409138 c645f301     MOV     byte [EBP+local_11], 0x1  ; yes -> local_11 = 1 (carry bit)
+                         LAB_0040913c:
+        0040913c 0fb64d08     MOVZX   ECX, byte [EBP+param_1]  ; ECX = x
+        00409140 d1e1         SHL     ECX, 0x1                  ; ECX = x << 1  (left shift)
+        00409142 884df2       MOV     byte [EBP+local_12], CL   ; local_12 = x << 1 (low byte)
+        00409145 0fb655f2     MOVZX   EDX, byte [EBP+local_12]  ; EDX = x << 1
+        00409149 0fb645f3     MOVZX   EAX, byte [EBP+local_11]  ; EAX = carry bit (0 or 1)
+        0040914d 0bd0         OR      EDX, EAX                  ; result = (x<<1) | carry  = ROTL
+        0040914f 8855f2       MOV     byte [EBP+local_12], DL   ; store ROTL result
+        ; ---------------------------------------------------------------------
+
+                         LAB_00409152:                           ; common return point
+        00409152 0fb645f2     MOVZX   EAX, byte [EBP+local_12]  ; EAX = rotation result
+
+        ; ----- /GS cookie check before return --------------------------------
+        00409156 8b4dfc       MOV     ECX, [EBP+local_8]         ; reload saved cookie_xored
+        00409159 33cd         XOR     ECX, EBP                   ; re-derive original constant
+        0040915b e8200a0000   CALL    __security_check_cookie    ; crash if cookie corrupted
+        00409160 8be5         MOV     ESP, EBP
+        00409162 5d           POP     EBP
+        00409163 c3           RET                                ; return result in AL
+
+
+; =============================================================================
+; FUN_00409170  –  nibble_step   (nibble swap + XOR)
+; -----------------------------------------------------------------------------
+; Swaps the high and low nibbles of *param_1, XORs with a table value, then
+; subtracts the mixed byte from the low nibble to produce the final result.
+; Writes the result back through the pointer AND returns it in AL.
+;
+; Algorithm:
+;   hi       = (*x << 4) & 0xFF   -- low nibble shifted to high position
+;   lo       = (*x >> 4) & 0x0F   -- high nibble shifted to low position
+;   mixed    = (hi + lo) XOR table[1 << 1]
+;            = (hi + lo) XOR table[2]
+;            = (hi + lo) XOR 0x00          -- table[2] = 0x00 -> XOR is a no-op
+;   result   = lo - mixed          (byte arithmetic, wraps mod 256)
+;   *x       = result              (written back through pointer)
+;   return     mixed               (note: returns mixed, not result)
+;
+; Hardcoded table (8 bytes on stack):
+;   {0x01, 0x03, 0x00, 0x07, 0x09, 0x0b, 0x0d, 0x0f}
+;   (Index 2 = 0x00 is always used; cookie-dependent entries are never accessed)
+;
+; Signature: char nibble_step(char *param_1)
+;   param_1 = pointer to ciphertext byte (modified in place)
+; Called by: FUN_004098b0 at 004098e6
+; =============================================================================
+                         char __cdecl FUN_00409170(char *param_1)
+
+        00409170 55           PUSH    EBP
+        00409171 8bec         MOV     EBP, ESP
+        00409173 83ec10       SUB     ESP, 0x10           ; 16 bytes of locals
+
+        ; ----- /GS stack cookie setup ----------------------------------------
+        00409176 a180d04500   MOV     EAX, [DAT_0045d080]  ; global cookie = 0xBB40E64E
+        0040917b 33c5         XOR     EAX, EBP             ; cookie_xored = cookie XOR EBP
+        0040917d 8945fc       MOV     [EBP+local_8], EAX   ; save cookie
+        ; ---------------------------------------------------------------------
+
+        ; ----- Build 8-byte table on the stack (only index 2 is used) --------
+        00409180 c645f401     MOV     byte [EBP+local_10], 0x01  ; table[0] = 0x01
+        00409184 c645f503     MOV     byte [EBP+local_f],  0x03  ; table[1] = 0x03
+        00409188 c645f600     MOV     byte [EBP+local_e],  0x00  ; table[2] = 0x00  <-- USED
+        0040918c c645f707     MOV     byte [EBP+local_d],  0x07  ; table[3] = 0x07
+        00409190 c645f809     MOV     byte [EBP+local_c],  0x09  ; table[4] = 0x09
+        00409194 c645f90b     MOV     byte [EBP+local_b],  0x0b  ; table[5] = 0x0b
+        00409198 c645fa0d     MOV     byte [EBP+local_a],  0x0d  ; table[6] = 0x0d
+        0040919c c645fb0f     MOV     byte [EBP+local_9],  0x0f  ; table[7] = 0x0f
+        ; ---------------------------------------------------------------------
+
+        ; ----- Compute hi nibble: (*x << 4) & 0xFF ---------------------------
+        004091a0 8b4508       MOV     EAX, [EBP+param_1]   ; EAX = pointer to byte
+        004091a3 0fbe08       MOVSX   ECX, byte [EAX]       ; ECX = *x (sign-extended)
+        004091a6 c1e104       SHL     ECX, 0x4              ; ECX = *x << 4  (low nibble -> high)
+        004091a9 884df3       MOV     byte [EBP+local_11], CL ; local_11 = hi = (*x << 4) & 0xFF
+        ; ---------------------------------------------------------------------
+
+        ; ----- Compute lo nibble: (*x >> 4) & 0x0F ---------------------------
+        004091ac 8b5508       MOV     EDX, [EBP+param_1]   ; EDX = pointer to byte
+        004091af 0fbe02       MOVSX   EAX, byte [EDX]       ; EAX = *x (sign-extended)
+        004091b2 c1f804       SAR     EAX, 0x4              ; EAX = *x >> 4 (arithmetic)
+        004091b5 83e00f       AND     EAX, 0xf              ; EAX = lo = (*x >> 4) & 0x0F
+        004091b8 8845f2       MOV     byte [EBP+local_12], AL ; local_12 = lo nibble
+        ; ---------------------------------------------------------------------
+
+        ; ----- Compute mixed = (hi + lo) XOR table[2] ------------------------
+        004091bb 0fb64df3     MOVZX   ECX, byte [EBP+local_11]  ; ECX = hi
+        004091bf 0fb655f2     MOVZX   EDX, byte [EBP+local_12]  ; EDX = lo
+        004091c3 03ca         ADD     ECX, EDX                   ; ECX = hi + lo
+        004091c5 b801000000   MOV     EAX, 0x1
+        004091ca d1e0         SHL     EAX, 0x1                   ; EAX = 1 << 1 = 2  (table index)
+        004091cc 0fb65405f4  MOVZX   EDX, byte [EBP+EAX*1-0xc]  ; EDX = table[2] = 0x00
+        004091d1 33ca         XOR     ECX, EDX                   ; mixed = (hi+lo) XOR 0x00 = hi+lo
+        004091d3 884df1       MOV     byte [EBP+local_13], CL    ; local_13 = mixed
+        ; ---------------------------------------------------------------------
+
+        ; ----- Compute result = lo - mixed, write back through pointer --------
+        004091d6 0fb645f2     MOVZX   EAX, byte [EBP+local_12]  ; EAX = lo
+        004091da 0fb64df1     MOVZX   ECX, byte [EBP+local_13]  ; ECX = mixed
+        004091de 2bc1         SUB     EAX, ECX                   ; EAX = lo - mixed  (result)
+        004091e0 8845f3       MOV     byte [EBP+local_11], AL    ; save result
+        004091e3 8b5508       MOV     EDX, [EBP+param_1]         ; EDX = pointer to original byte
+        004091e6 8a45f3       MOV     AL,  byte [EBP+local_11]   ; AL  = result
+        004091e9 8802         MOV     byte [EDX], AL             ; *param_1 = result  (write back)
+        ; ---------------------------------------------------------------------
+
+        ; ----- Return value is mixed (local_13), not result ------------------
+        004091eb 0fb645f1     MOVZX   EAX, byte [EBP+local_13]  ; return mixed in AL
+
+        ; ----- /GS cookie check ----------------------------------------------
+        004091ef 8b4dfc       MOV     ECX, [EBP+local_8]
+        004091f2 33cd         XOR     ECX, EBP
+        004091f4 e887090000   CALL    __security_check_cookie
+        004091f9 8be5         MOV     ESP, EBP
+        004091fb 5d           POP     EBP
+        004091fc c3           RET
+
+
+; =============================================================================
+; FUN_00409430  –  bit_permute   (6-bit field scatter)
+; -----------------------------------------------------------------------------
+; Rearranges four 2-bit fields within a byte, then XORs the result with a
+; table value selected by the low 3 bits of the permuted byte.
+;
+; Algorithm (extracting 2-bit groups from bits [7:6], [5:4], [3:2], [1:0]):
+;   fa = (x & 0x30) >> 4   -- bits[5:4] -> bits[1:0]
+;   fb = (x & 0x0c) << 4   -- bits[3:2] -> bits[7:6]
+;   fc = (x & 0x03) << 2   -- bits[1:0] -> bits[3:2]
+;   fd = (x >> 2)  & 0x30  -- bits[7:6] -> bits[5:4]
+;   permuted = fa | fb | fc | fd
+;   result = permuted XOR table[permuted & 7]
+;
+; Hardcoded 9-byte table (only indices 0-7 used):
+;   {0x00, 0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f}
+; The XOR step effectively cancels for many inputs (odd table values just
+; flip bit 0 in some cases), making the permutation the dominant operation.
+;
+; NOTE: The function returns local_11 (the permuted byte BEFORE XOR) in EAX
+;       at 004094c6, effectively ignoring the XOR result stored in local_12.
+;       The XOR step appears to be dead code for the return value.
+;
+; Signature: byte bit_permute(byte param_1)
+; Called by: FUN_00409030 (bit_permute_wrapper) at 00409038
+; =============================================================================
+                         byte __cdecl FUN_00409430(byte param_1)
+
+        00409430 55           PUSH    EBP
+        00409431 8bec         MOV     EBP, ESP
+        00409433 83ec10       SUB     ESP, 0x10           ; 16 bytes of locals
+
+        ; ----- /GS stack cookie setup ----------------------------------------
+        00409436 a180d04500   MOV     EAX, [DAT_0045d080]
+        0040943b 33c5         XOR     EAX, EBP
+        0040943d 8945fc       MOV     [EBP+local_8], EAX
+        ; ---------------------------------------------------------------------
+
+        ; ----- Build 9-byte XOR table on the stack ---------------------------
+        00409440 c645f300     MOV     byte [EBP+local_11], 0x00  ; table[0] = 0x00  (used as temp too)
+        00409444 c645f401     MOV     byte [EBP+local_10], 0x01  ; table[0] = 0x01
+        00409448 c645f503     MOV     byte [EBP+local_f],  0x03  ; table[1] = 0x03
+        0040944c c645f605     MOV     byte [EBP+local_e],  0x05  ; table[2] = 0x05
+        00409450 c645f707     MOV     byte [EBP+local_d],  0x07  ; table[3] = 0x07
+        00409454 c645f809     MOV     byte [EBP+local_c],  0x09  ; table[4] = 0x09  <- index 0
+        00409458 c645f90b     MOV     byte [EBP+local_b],  0x0b  ; table[5] = 0x0b  <- index 1
+        0040945c c645fa0d     MOV     byte [EBP+local_a],  0x0d  ; table[6] = 0x0d  <- index 2
+        00409460 c645fb0f     MOV     byte [EBP+local_9],  0x0f  ; table[7] = 0x0f  <- index 3
+        ; ---------------------------------------------------------------------
+
+        ; ----- Extract and scatter the four 2-bit fields ---------------------
+        ; fa: bits[5:4] of x  -->  bits[1:0] of result
+        00409464 0fb64508     MOVZX   EAX, byte [EBP+param_1]  ; EAX = x
+        00409468 83e030       AND     EAX, 0x30                 ; EAX = x & 0x30  (bits 5:4)
+        0040946b c1f804       SAR     EAX, 0x4                  ; EAX = (x & 0x30) >> 4  = fa
+        0040946e 8845f2       MOV     byte [EBP+local_12], AL   ; local_12 = fa
+
+        ; fb: bits[3:2] of x  -->  bits[7:6] of result
+        00409471 0fb64d08     MOVZX   ECX, byte [EBP+param_1]  ; ECX = x
+        00409475 83e10c       AND     ECX, 0x0c                 ; ECX = x & 0x0c  (bits 3:2)
+        00409478 c1e104       SHL     ECX, 0x4                  ; ECX = (x & 0x0c) << 4  = fb
+        0040947b 884df1       MOV     byte [EBP+local_13], CL   ; local_13 = fb
+
+        ; fc: bits[1:0] of x  -->  bits[3:2] of result
+        0040947e 0fb65508     MOVZX   EDX, byte [EBP+param_1]  ; EDX = x
+        00409482 c1e202       SHL     EDX, 0x2                  ; EDX = x << 2
+        00409485 83e20c       AND     EDX, 0x0c                 ; EDX = (x<<2) & 0x0c  = fc
+        00409488 8855f3       MOV     byte [EBP+local_11], DL   ; local_11 = fc
+
+        ; fd: bits[7:6] of x  -->  bits[5:4] of result
+        0040948b 0fb64508     MOVZX   EAX, byte [EBP+param_1]  ; EAX = x
+        0040948f c1f802       SAR     EAX, 0x2                  ; EAX = x >> 2
+        00409492 83e030       AND     EAX, 0x30                 ; EAX = (x>>2) & 0x30  = fd
+        00409495 8845f0       MOV     byte [EBP+local_14], AL   ; local_14 = fd
+        ; ---------------------------------------------------------------------
+
+        ; ----- Combine all four fields into permuted byte --------------------
+        00409498 0fb64df3     MOVZX   ECX, byte [EBP+local_11]  ; ECX = fc
+        0040949c 0fb655f2     MOVZX   EDX, byte [EBP+local_12]  ; EDX = fa
+        004094a0 0bca         OR      ECX, EDX                   ; ECX = fc | fa
+        004094a2 0fb645f1     MOVZX   EAX, byte [EBP+local_13]  ; EAX = fb
+        004094a6 0bc8         OR      ECX, EAX                   ; ECX = fc | fa | fb
+        004094a8 0fb655f0     MOVZX   EDX, byte [EBP+local_14]  ; EDX = fd
+        004094ac 0bca         OR      ECX, EDX                   ; ECX = fc | fa | fb | fd = permuted
+        004094ae 884df3       MOV     byte [EBP+local_11], CL    ; local_11 = permuted byte
+        ; ---------------------------------------------------------------------
+
+        ; ----- XOR permuted with table[permuted & 7] (appears to be dead code for return) --
+        004094b1 0fb645f3     MOVZX   EAX, byte [EBP+local_11]  ; EAX = permuted
+        004094b5 0fb64df3     MOVZX   ECX, byte [EBP+local_11]  ; ECX = permuted
+        004094b9 83e107       AND     ECX, 0x7                   ; ECX = permuted & 7  (table index)
+        004094bc 0fb6540df4  MOVZX   EDX, byte [EBP+ECX*1-0xc]  ; EDX = table[permuted & 7]
+        004094c1 33c2         XOR     EAX, EDX                   ; EAX = permuted XOR table[i]
+        004094c3 8845f2       MOV     byte [EBP+local_12], AL    ; local_12 = XOR result (not returned)
+        ; ---------------------------------------------------------------------
+
+        ; ----- Return the permuted byte (pre-XOR) – XOR result is discarded --
+        004094c6 0fb645f3     MOVZX   EAX, byte [EBP+local_11]  ; return permuted (local_11, NOT local_12)
+        ;                                                         ; XOR result in local_12 is DEAD CODE
+
+        ; ----- /GS cookie check ----------------------------------------------
+        004094ca 8b4dfc       MOV     ECX, [EBP+local_8]
+        004094cd 33cd         XOR     ECX, EBP
+        004094cf e8ac060000   CALL    __security_check_cookie
+        004094d4 8be5         MOV     ESP, EBP
+        004094d6 5d           POP     EBP
+        004094d7 c3           RET
+
+
+; =============================================================================
+; FUN_00409840  –  load_key   (reads 32-byte key from .enc file)
+; -----------------------------------------------------------------------------
+; Reads the two 16-byte key halves from the beginning and end of the .enc file
+; into a contiguous 32-byte buffer.
+;
+; File layout exploited:
+;   bytes [0..15]      -> key_buf[0..15]   (first fread from current position)
+;   bytes [-16..-1]    -> key_buf[16..31]  (second fread after SEEK_END -16)
+;   File pointer is then reset to offset 16 (start of ciphertext).
+;
+; Returns 0x1F (= 31) – presumably the last valid key index.
+;
+; Signature: uint4 load_key(_iobuf *param_1, void *param_2)
+;   param_1 = FILE* for the open .enc file
+;   param_2 = pointer to the 32-byte key_schedule buffer
+; Called by: FUN_004094e0 at 00409555
+; =============================================================================
+                         undefined4 __cdecl FUN_00409840(_iobuf *param_1, void *param_2)
+
+        00409840 55           PUSH    EBP
+        00409841 8bec         MOV     EBP, ESP
+        00409843 51           PUSH    ECX                ; reserve 1 dword of local space
+
+        ; ----- Read first 16 bytes (key[0..15]) from start of file -----------
+        00409844 8b4508       MOV     EAX, [EBP+param_1]    ; EAX = FILE*
+        00409847 50           PUSH    EAX                    ; push stream
+        00409848 6a10         PUSH    0x10                   ; count = 16
+        0040984a 6a01         PUSH    0x1                    ; size  = 1
+        0040984c b901000000   MOV     ECX, 0x1
+        00409851 6bd100       IMUL    EDX, ECX, 0x0          ; EDX = 1 * 0 = 0  (offset into buf)
+        00409854 03550c       ADD     EDX, [EBP+param_2]     ; EDX = key_buf + 0  = &key_buf[0]
+        00409857 52           PUSH    EDX                    ; push destination buffer
+        00409858 e8b3700000   CALL    _fread                 ; fread(&key_buf[0], 1, 16, fp)
+        0040985d 83c410       ADD     ESP, 0x10
+        ; file pointer is now at offset 16
+        ; ---------------------------------------------------------------------
+
+        ; ----- Seek to 16 bytes before end of file ---------------------------
+        00409860 6a02         PUSH    0x2                    ; SEEK_END = 2
+        00409862 6af0         PUSH    -0x10                  ; offset = -16
+        00409864 8b4508       MOV     EAX, [EBP+param_1]    ; FILE*
+        00409867 50           PUSH    EAX
+        00409868 e8c3860000   CALL    FUN_00411f30           ; fseek(fp, -16, SEEK_END)
+        0040986d 83c40c       ADD     ESP, 0xc
+        ; file pointer is now at: file_size - 16
+        ; ---------------------------------------------------------------------
+
+        ; ----- Read last 16 bytes (key[16..31]) ------------------------------
+        00409870 8b4d08       MOV     ECX, [EBP+param_1]    ; FILE*
+        00409873 51           PUSH    ECX
+        00409874 6a10         PUSH    0x10                   ; count = 16
+        00409876 6a01         PUSH    0x1                    ; size  = 1
+        00409878 ba01000000   MOV     EDX, 0x1
+        0040987d c1e204       SHL     EDX, 0x4               ; EDX = 1 << 4 = 16  (byte offset)
+        00409880 03550c       ADD     EDX, [EBP+param_2]     ; EDX = key_buf + 16 = &key_buf[16]
+        00409883 52           PUSH    EDX
+        00409884 e887700000   CALL    _fread                 ; fread(&key_buf[16], 1, 16, fp)
+        00409889 83c410       ADD     ESP, 0x10
+        ; key_buf[0..31] is now fully populated
+        ; ---------------------------------------------------------------------
+
+        ; ----- Seek back to offset 16 (start of ciphertext) -----------------
+        0040988c 6a00         PUSH    0x0                    ; SEEK_SET = 0
+        0040988e 6a10         PUSH    0x10                   ; offset = 16
+        00409890 8b4508       MOV     EAX, [EBP+param_1]
+        00409893 50           PUSH    EAX
+        00409894 e897860000   CALL    FUN_00411f30           ; fseek(fp, 16, SEEK_SET)
+        00409899 83c40c       ADD     ESP, 0xc
+        ; file pointer now at byte 16, ready for ciphertext reads
+        ; ---------------------------------------------------------------------
+
+        ; ----- Return 0x1F (= 31, the last key index) ------------------------
+        0040989c b81f000000   MOV     EAX, 0x1f             ; return value = 31
+        004098a1 eb03         JMP     LAB_004098a6
+                         LAB_004098a6:
+        004098a6 8be5         MOV     ESP, EBP
+        004098a8 5d           POP     EBP
+        004098a9 c3           RET
+
+
+; =============================================================================
+; FUN_004098b0  –  decrypt_one_byte   (cipher chain orchestrator)
+; -----------------------------------------------------------------------------
+; Applies the full four-step decryption pipeline to a single ciphertext byte,
+; selecting the key byte from the schedule based on position parity.
+;
+; Pipeline (in execution order):
+;   1. bit_permute  (FUN_00409030 -> FUN_00409430)
+;   2. cond_rotate  (FUN_004090b0, selector=0x1)
+;   3. nibble_step  (FUN_00409170)   -- operates via pointer, returns 'mixed'
+;      NOTE: the return value (mixed) is stored into local_5, overwriting
+;            the result that nibble_step wrote back through the pointer.
+;            The caller uses local_5 (= mixed) as the input to gf_mix,
+;            NOT the value written back through the pointer.
+;   4. gf_mix       (FUN_00409050)  using:
+;        even position (param_3 & 1 == 0): key_schedule[0]    (key[0])
+;        odd  position (param_3 & 1 == 1): key_schedule[0x1f] (key[31])
+;
+; Signature: byte decrypt_one_byte(byte param_1, byte *param_2, uint param_3)
+;   param_1 = ciphertext byte
+;   param_2 = pointer to 32-byte key_schedule buffer
+;   param_3 = current byte index i (used for parity check)
+; Called by: FUN_004094e0 (main decrypt loop) at 00409618
+; =============================================================================
+                         byte __cdecl FUN_004098b0(byte param_1, byte *param_2, uint param_3)
+
+        004098b0 55           PUSH    EBP
+        004098b1 8bec         MOV     EBP, ESP
+        004098b3 51           PUSH    ECX                     ; reserve local_5 and local_6
+
+        ; ----- Load ciphertext byte into local working register ---------------
+        004098b4 8a4508       MOV     AL, byte [EBP+param_1]  ; AL = ciphertext byte
+        004098b7 8845ff       MOV     byte [EBP+local_5], AL  ; local_5 = working byte
+
+        ; =================================================================
+        ; STEP 1: bit_permute
+        ; =================================================================
+        004098ba 0fb64dff     MOVZX   ECX, byte [EBP+local_5]  ; ECX = current byte
+        004098be 51           PUSH    ECX                       ; pass as argument
+        004098bf e86cf7ffff   CALL    FUN_00409030              ; bit_permute_wrapper(local_5)
+        004098c4 83c404       ADD     ESP, 0x4
+        004098c7 8845ff       MOV     byte [EBP+local_5], AL   ; local_5 = permuted byte
+
+        ; =================================================================
+        ; STEP 2: cond_rotate
+        ; =================================================================
+        004098ca 6a01         PUSH    0x1                       ; param_2 = 0x1 (direction mask)
+        004098cc 0fb655ff     MOVZX   EDX, byte [EBP+local_5]  ; EDX = permuted byte
+        004098d0 52           PUSH    EDX                       ; param_1 = permuted byte
+        004098d1 e8daf7ffff   CALL    FUN_004090b0              ; cond_rotate(local_5, 0x1)
+        004098d6 83c408       ADD     ESP, 0x8
+        004098d9 8845ff       MOV     byte [EBP+local_5], AL   ; local_5 = rotated byte
+
+        ; =================================================================
+        ; STEP 3: nibble_step  (via pointer)
+        ; =================================================================
+        004098dc 8a45ff       MOV     AL, byte [EBP+local_5]   ; AL = rotated byte
+        004098df 8845fe       MOV     byte [EBP+local_6], AL   ; local_6 = copy for pointer pass
+        004098e2 8d4dfe       LEA     ECX, [EBP-0x2]            ; ECX = &local_6
+        004098e5 51           PUSH    ECX                       ; pass pointer to local_6
+        004098e6 e885f8ffff   CALL    FUN_00409170              ; nibble_step(&local_6)
+        004098eb 83c404       ADD     ESP, 0x4
+        ; AL = mixed (return value of nibble_step)
+        ; local_6 = result (lo - mixed, written back through pointer – NOT used)
+        004098ee 8845ff       MOV     byte [EBP+local_5], AL   ; local_5 = mixed  (the return value)
+
+        ; =================================================================
+        ; STEP 4: gf_mix  –  key byte selected by position parity
+        ; =================================================================
+        004098f1 8b5510       MOV     EDX, [EBP+param_3]       ; EDX = position index i
+        004098f4 83e201       AND     EDX, 0x1                  ; test bit 0 (parity)
+        004098f7 7522         JNZ     LAB_0040991b              ; odd i -> use key[31] branch
+
+        ; ----- Even position: use key_schedule[0] = key[0] ------------------
+        004098f9 b801000000   MOV     EAX, 0x1
+        004098fe 6bc800       IMUL    ECX, EAX, 0x0             ; ECX = 0  (index into key_schedule)
+        00409901 8b550c       MOV     EDX, [EBP+param_2]        ; EDX = key_schedule ptr
+        00409904 0fb6040a     MOVZX   EAX, byte [EDX+ECX*1]     ; EAX = key_schedule[0]  = key[0]
+        00409908 50           PUSH    EAX                        ; push key byte
+        00409909 0fb64dff     MOVZX   ECX, byte [EBP+local_5]   ; ECX = mixed byte
+        0040990d 51           PUSH    ECX
+        0040990e e83df7ffff   CALL    FUN_00409050               ; gf_mix(mixed, key[0])
+        00409913 83c408       ADD     ESP, 0x8
+        00409916 8845ff       MOV     byte [EBP+local_5], AL    ; local_5 = plaintext byte
+        00409919 eb20         JMP     LAB_0040993b               ; jump to return
+        ; ---------------------------------------------------------------------
+
+                         LAB_0040991b:
+        ; ----- Odd position: use key_schedule[0x1f] = key[31] ---------------
+        0040991b ba01000000   MOV     EDX, 0x1
+        00409920 6bc21f       IMUL    EAX, EDX, 0x1f             ; EAX = 0x1f = 31  (key index)
+        00409923 8b4d0c       MOV     ECX, [EBP+param_2]         ; ECX = key_schedule ptr
+        00409926 0fb61401     MOVZX   EDX, byte [ECX+EAX*1]      ; EDX = key_schedule[31] = key[31]
+        0040992a 52           PUSH    EDX                         ; push key byte
+        0040992b 0fb645ff     MOVZX   EAX, byte [EBP+local_5]    ; EAX = mixed byte
+        0040992f 50           PUSH    EAX
+        00409930 e81bf7ffff   CALL    FUN_00409050                ; gf_mix(mixed, key[31])
+        00409935 83c408       ADD     ESP, 0x8
+        00409938 8845ff       MOV     byte [EBP+local_5], AL     ; local_5 = plaintext byte
+        ; ---------------------------------------------------------------------
+
+                         LAB_0040993b:
+        ; ----- Return decrypted plaintext byte --------------------------------
+        0040993b 0fb645ff     MOVZX   EAX, byte [EBP+local_5]   ; EAX = plaintext byte
+        0040993f 8be5         MOV     ESP, EBP
+        00409941 5d           POP     EBP
+        00409942 c3           RET
