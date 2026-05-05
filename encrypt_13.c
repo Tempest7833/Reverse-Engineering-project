@@ -7,7 +7,7 @@
  *         Reads <filename>, encrypts it, writes <filename>.enc
  *
  * Key derivation:
- *   key[32] = SHA-256( argv[2] )   (hash of the password string)
+ *   key[32] = SHA-256( argv[1] )   (hash of the password string)
  *
  * .enc file layout:
  *   [0 ..15]        key[0..15]        (first half of SHA-256 digest)
@@ -133,7 +133,7 @@ static void sha256_final(sha256_ctx *ctx, uint8_t digest[32]) {
     }
 }
 
-/* Hash a C string -- the key derivation: sha256(argv[2]) */
+/* Hash a C string -- the key derivation: sha256(argv[1]) */
 static void sha256_string(const char *s, uint8_t digest[32]) {
     sha256_ctx ctx;
     sha256_init(&ctx);
@@ -290,8 +290,8 @@ static uint8_t decrypt_byte(uint8_t ct, uint8_t key_byte) {
 /* Encrypt one byte -  inverse of FUN_004098b0 */
 static uint8_t encrypt_byte(uint8_t pt, uint8_t key_byte) {
     uint8_t v = gf_mix(pt, key_byte);   /* gf_mix is self-inverse (XOR) */
-    v = NS_INV[v];                       /* inverse nibble_step            */
-    v = CR_INV[v];                       /* inverse cond_rotate            */
+    v = CR_INV[v];                       /* inverse nibble_step            */
+    v = NS_INV[v];                       /* inverse cond_rotate            */
     v = BP_INV[v];                       /* inverse bit_permute            */
     return v;
 }
@@ -332,7 +332,7 @@ int main(int argc, char *argv[]) {
     size_t   base;
 
         /* Argument check                                                       */
-        if (argc < 3) {
+        if (argc < 2) {
         fprintf(stderr,
             "\n\nTo Encrypt: ENTER \"filename\" \"password\"\n"
             "\t%s filename password\n\n"
@@ -340,6 +340,9 @@ int main(int argc, char *argv[]) {
             (argc > 0 ? argv[0] : "encryptor"));
         return 1;
     }
+    if (!self_test()) {
+    fprintf(stderr, "Error - cipher self-test failed\n");
+    return 1;
 
         /* Open and size the input file                                         */
         fin = fopen(argv[1], "rb");
@@ -388,13 +391,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-        /* Key derivation: SHA-256 of the password string (argv[2])           */
+        /* Key derivation: SHA-256 of the password string (argv[1])           */
     /*                                                                      */
     /* The decryptor reads the key directly from the .enc file header --   */
     /* it never re-derives it.  So we are free to choose any derivation   */
     /* we like.  The assignment specifies the key comes from the password  */
     /* passed on the command line.                                          */
-        sha256_string(argv[2], key);
+        sha256_string(argv[1], key);
 
         /* Build output filename: append .enc to the full input filename      */
         base = strlen(argv[1]);
@@ -435,24 +438,24 @@ int main(int argc, char *argv[]) {
     /*   even i: ks[0]  = key[0]   */
     /*   odd  i: ks[31] = key[31]   */
   
+/* First 16-byte header/state */
+if (fwrite(key, 1, 16, fout) != 16) {
+    fprintf(stderr, "Error - Write failed (header)\n");
+    goto fail;
+}
 
-    /* Header part 1 */
-    if (fwrite(key, 1, 16, fout) != 16) {
-        fprintf(stderr, "Error - Write failed (header)\n");
+    /* Encrypted plaintext plus 16 encrypted filler bytes */
+   for (i = 0; i < (size_t)fsize; i++) {
+    uint8_t key_byte = (i & 2) ? key[30] : key[1];
+    uint8_t ct = encrypt_byte(plaintext[i], key_byte);
+
+    if (fwrite(&ct, 1, 1, fout) != 1) {
+        fprintf(stderr, "Error - Write failed at encrypted byte %zu\n", i);
         goto fail;
     }
+}
 
-    /* Ciphertext */
-    for (i = 0; i < (size_t)fsize; i++) {
-        uint8_t key_byte = key[i % 32];
-        uint8_t ct = encrypt_byte(plaintext[i], key_byte);
-        if (fwrite(&ct, 1, 1, fout) != 1) {
-            fprintf(stderr, "Error - Write failed at ciphertext byte %zu\n", i);
-            goto fail;
-        }
-    }
-
-    /* Header part 2 */
+    /* Final 16-byte trailer/state */
     if (fwrite(key + 16, 1, 16, fout) != 16) {
         fprintf(stderr, "Error - Write failed (footer)\n");
         goto fail;
@@ -468,7 +471,7 @@ int main(int argc, char *argv[]) {
         "  Key[0]=0x%02x  Key[31]=0x%02x  [SHA-256(\"%s\")]\n",
         argv[1], outname,
         fsize, fsize + 32,
-        key[0], key[31], argv[2]);
+        key[1], key[30], argv[1]);
 
     return 0;
 
