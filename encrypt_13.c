@@ -1,4 +1,26 @@
-
+/*
+ * encryptor.c
+ *
+ * Produces .enc files that are exactly compatible with the original decryptor binary.
+ *
+ * Usage:  encryptor <filename> <password>
+ *         Reads <filename>, encrypts it, writes <filename>.enc
+ *
+ * Key derivation:
+ *   key[32] = SHA-256( argv[2] )   (hash of the password string)
+ *
+ * .enc file layout:
+ *   [0 ..15]        key[0..15]        (first half of SHA-256 digest)
+ *   [16..16+N-1]    ciphertext        (N = plaintext length)
+ *   [16+N..31+N]    key[16..31]       (second half of SHA-256 digest)
+ *
+ * Per-byte cipher (reverse-engineered from FUN_004098b0):
+ *   DECRYPT:  ct -> bit_permute -> cond_rotate -> nibble_step -> gf_mix -> pt
+ *   ENCRYPT:  pt -> gf_mix      -> ns_inv      -> cr_inv      -> bp_inv -> ct
+ *
+ *   Key used per byte position i (0-based):
+ *     key[i % 32]   (cycles through all 32 key bytes)
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,7 +133,7 @@ static void sha256_final(sha256_ctx *ctx, uint8_t digest[32]) {
     }
 }
 
-/* Hash a C string — the key derivation: sha256(argv[1]) */
+/* Hash a C string -- the key derivation: sha256(argv[2]) */
 static void sha256_string(const char *s, uint8_t digest[32]) {
     sha256_ctx ctx;
     sha256_init(&ctx);
@@ -119,9 +141,12 @@ static void sha256_string(const char *s, uint8_t digest[32]) {
     sha256_final(&ctx, digest);
 }
 
-/* Cipher components  (reverse-engineered from FUN_004098b0 and sub-functions)
+/*
+ * Cipher components  (reverse-engineered from FUN_004098b0 and sub-functions)
+ *
  * DECRYPT chain (original binary, FUN_004098b0):
  *   ct  ->  bit_permute  ->  cond_rotate  ->  nibble_step  ->  gf_mix  ->  pt
+ *
  * ENCRYPT chain (this program, exact inverse):
  *   pt  ->  gf_mix  ->  NS_INV[]  ->  CR_INV[]  ->  BP_INV[]  ->  ct
  */
@@ -271,7 +296,10 @@ static uint8_t encrypt_byte(uint8_t pt, uint8_t key_byte) {
     return v;
 }
 
-/*  Verifies encrypt(decrypt(ct, k), k) == ct for all 65,536 (ct, k) pairs. */
+/*
+ * Self-test: run before touching any file.
+ * Verifies encrypt(decrypt(ct, k), k) == ct for all 65,536 (ct, k) pairs.
+ */
 static int self_test(void) {
     int ct, key;
     for (ct = 0; ct < 256; ct++) {
@@ -303,19 +331,18 @@ int main(int argc, char *argv[]) {
     char     outname[4096];
     size_t   base;
 
-    /* Argument check */
-  
-    if (argc < 2) {
+        /* Argument check                                                       */
+        if (argc < 3) {
         fprintf(stderr,
-            "\n\nTo Encrypt: ENTER \"filename\"\n"
-            "\t%s filename\n\n"
+            "\n\nTo Encrypt: ENTER \"filename\" \"password\"\n"
+            "\t%s filename password\n\n"
             "The output file will have a '.enc' extension.\n",
             (argc > 0 ? argv[0] : "encryptor"));
         return 1;
     }
 
-    /* Open and size the input file  */
-    fin = fopen(argv[1], "rb");
+        /* Open and size the input file                                         */
+        fin = fopen(argv[1], "rb");
     if (!fin) {
         fprintf(stderr, "\n\nError - Could not open input file (%s)\n", argv[1]);
         return 1;
@@ -344,8 +371,8 @@ int main(int argc, char *argv[]) {
     }
     rewind(fin);
 
-    /* Read plaintext */
-    plaintext = (uint8_t *)malloc((size_t)fsize);
+        /* Read plaintext                                                       */
+        plaintext = (uint8_t *)malloc((size_t)fsize);
     if (!plaintext) {
         fprintf(stderr, "Error - Could not allocate %ld bytes\n", fsize);
         fclose(fin);
@@ -361,29 +388,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-       /* Key derivation: SHA-256 of the filename string (argv[1])            */
-       /* The original binary embeds the 32-byte key in the .enc header.      */
-    /* When the user runs the decryptor as:  decryptor.exe secret.enc      */
-    /* the key is read straight from the file — the filename string is     */
-    /* only used to locate the file, not re-hashed at decrypt time.        */
+        /* Key derivation: SHA-256 of the password string (argv[2])           */
     /*                                                                      */
-    /* Therefore our encryptor and decryptor must agree on what string to  */
-    /* hash.  The convention matching the original is:                      */
-    /*   key = SHA-256( argv[1] )  where argv[1] is the plain filename.   */
-       sha256_string(argv[1], key);
+    /* The decryptor reads the key directly from the .enc file header --   */
+    /* it never re-derives it.  So we are free to choose any derivation   */
+    /* we like.  The assignment specifies the key comes from the password  */
+    /* passed on the command line.                                          */
+        sha256_string(argv[2], key);
 
-       /* Build output filename: strip existing extension, append .enc  */
-       base = strlen(argv[1]);
-    {
-        size_t j;
-        /* walk backward to find the last '.' */
-        for (j = base; j > 0; j--) {
-            if (argv[1][j-1] == '.') {
-                base = j - 1;   /* cut before the dot */
-                break;
-            }
-        }
-    }
+        /* Build output filename: append .enc to the full input filename      */
+        base = strlen(argv[1]);
     if (base + 5 >= sizeof(outname)) {
         fprintf(stderr, "Error - Output filename too long\n");
         free(plaintext);
@@ -392,15 +406,15 @@ int main(int argc, char *argv[]) {
     memcpy(outname, argv[1], base);
     memcpy(outname + base, ".enc", 5); /* 4 chars + NUL */
 
-        /* Open output file  */
-       fout = fopen(outname, "wb");
+        /* Open output file                                                     */
+        fout = fopen(outname, "wb");
     if (!fout) {
         fprintf(stderr, "Error - Could not open output file (%s)\n", outname);
         free(plaintext);
         return 1;
     }
 
-       /* Write .enc file   */
+        /* Write .enc file   */
     /*                                                                      */
     /* Layout (matched byte-for-byte to what FUN_00409840 expects):        */
     /*                                                                      */
@@ -454,7 +468,7 @@ int main(int argc, char *argv[]) {
         "  Key[0]=0x%02x  Key[31]=0x%02x  [SHA-256(\"%s\")]\n",
         argv[1], outname,
         fsize, fsize + 32,
-        key[0], key[31], argv[1]);
+        key[0], key[31], argv[2]);
 
     return 0;
 
