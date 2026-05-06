@@ -165,13 +165,16 @@ static uint8_t gf_mix(uint8_t x, uint8_t key_byte) {
  * ROT_TABLE[x & 7] & 1 == 1  =>  ROTR(x, 1)
  *   else  ROTL(x, 1)
  */
-static const uint8_t ROT_TABLE[8] = {0xfb, 0x1d, 0xa1, 0xd7, 0xb3, 0xe9, 0x2f, 0xc5};
+static uint8_t rol8(uint8_t x) {
+    return (uint8_t)((x << 1) | (x >> 7));
+}
+
+static uint8_t ror8(uint8_t x) {
+    return (uint8_t)((x >> 1) | (x << 7));
+}
 
 static uint8_t cond_rotate(uint8_t x) {
-    if (ROT_TABLE[x & 7] & 1)
-        return (uint8_t)((x >> 1) | ((x & 1) << 7));   /* ROTR 1 */
-    else
-        return (uint8_t)((x << 1) | ((x >> 7) & 1));   /* ROTL 1 */
+    return rol8(x);
 }
 
 /* --- Nibble step (FUN_00409170) ---
@@ -189,7 +192,7 @@ static uint8_t nibble_step(uint8_t x) {
     uint8_t hi  = (uint8_t)(x << 4);
     uint8_t lo  = (uint8_t)((x >> 4) & 0x0f);
     uint8_t sum = (uint8_t)(hi + lo);
-    return (uint8_t)(sum ^ 0x0d);
+    return sum;
 }
 
 /*  Bit permute (FUN_00409430) 
@@ -202,11 +205,12 @@ static uint8_t nibble_step(uint8_t x) {
  * Confirmed at 004094c6: MOVZX EAX, local_11  (not local_12).
  */
 static uint8_t bit_permute(uint8_t x) {
-    uint8_t fa = (x & 0x30) >> 4;            /* bits[5:4] -> bits[1:0] */
-    uint8_t fb = (uint8_t)((x & 0x0c) << 4); /* bits[3:2] -> bits[7:6] */
-    uint8_t fc = (uint8_t)((x & 0x03) << 2); /* bits[1:0] -> bits[3:2] */
-    uint8_t fd = (uint8_t)((x >> 2) & 0x30); /* bits[7:6] -> bits[5:4] */
-    return fa | fb | fc | fd;
+    uint8_t part1 = (uint8_t)((x & 0xC0) >> 4);
+    uint8_t part2 = (uint8_t)((x & 0x03) << 4);
+    uint8_t part3 = (uint8_t)((x << 2) & 0xC0);
+    uint8_t part4 = (uint8_t)((x >> 2) & 0x03);
+
+    return (uint8_t)(part1 | part2 | part3 | part4);
 }
 
 /* 
@@ -217,6 +221,7 @@ static uint8_t bit_permute(uint8_t x) {
   */
 
 /* Inverse of bit_permute */
+/*
 static const uint8_t BP_INV[256] = {
     0x00,0x10,0x20,0x30,0x01,0x11,0x21,0x31,0x02,0x12,0x22,0x32,0x03,0x13,0x23,0x33,
     0x40,0x50,0x60,0x70,0x41,0x51,0x61,0x71,0x42,0x52,0x62,0x72,0x43,0x53,0x63,0x73,
@@ -235,6 +240,8 @@ static const uint8_t BP_INV[256] = {
     0x8c,0x9c,0xac,0xbc,0x8d,0x9d,0xad,0xbd,0x8e,0x9e,0xae,0xbe,0x8f,0x9f,0xaf,0xbf,
     0xcc,0xdc,0xec,0xfc,0xcd,0xdd,0xed,0xfd,0xce,0xde,0xee,0xfe,0xcf,0xdf,0xef,0xff
 };
+*/
+static uint8_t BP_INV[256];
 
 /* Inverse of cond_rotate */
 static const uint8_t CR_INV[256] = {
@@ -257,6 +264,8 @@ static const uint8_t CR_INV[256] = {
 };
 
 /* Inverse of nibble_step */
+static uint8_t NS_INV[256];
+/*
 static const uint8_t NS_INV[256] = {
     0xd0,0xc0,0xf0,0xe0,0x90,0x80,0xb0,0xa0,0x50,0x40,0x70,0x60,0x10,0x00,0x30,0x20,
     0xd1,0xc1,0xf1,0xe1,0x91,0x81,0xb1,0xa1,0x51,0x41,0x71,0x61,0x11,0x01,0x31,0x21,
@@ -275,14 +284,40 @@ static const uint8_t NS_INV[256] = {
     0xde,0xce,0xfe,0xee,0x9e,0x8e,0xbe,0xae,0x5e,0x4e,0x7e,0x6e,0x1e,0x0e,0x3e,0x2e,
     0xdf,0xcf,0xff,0xef,0x9f,0x8f,0xbf,0xaf,0x5f,0x4f,0x7f,0x6f,0x1f,0x0f,0x3f,0x2f
 };
+*/
+
+static void build_ns_inverse(void) {
+    int i;
+
+    memset(NS_INV, 0, sizeof(NS_INV));
+
+    for (i = 0; i < 256; i++) {
+        uint8_t x = (uint8_t)i;
+        uint8_t y = nibble_step(x);
+        NS_INV[y] = x;
+    }
+}
+
+static void build_bp_inverse(void) {
+    int i;
+
+    memset(BP_INV, 0, sizeof(BP_INV));
+
+    for (i = 0; i < 256; i++) {
+        uint8_t x = (uint8_t)i;
+        uint8_t y = bit_permute(x);
+        BP_INV[y] = x;
+    }
+}
+
 
 /* decrypt/encrypt per-byte functions */
 
 /* Decrypt one byte - mirrors FUN_004098b0  */
 static uint8_t decrypt_byte(uint8_t ct, uint8_t key_byte) {
     uint8_t v = bit_permute(ct);
-    v = cond_rotate(v);
     v = nibble_step(v);
+    v = rol8(v);
     v = gf_mix(v, key_byte);
     return v;
 }
@@ -290,11 +325,27 @@ static uint8_t decrypt_byte(uint8_t ct, uint8_t key_byte) {
 /* Encrypt one byte -  inverse of FUN_004098b0 */
 static uint8_t encrypt_byte(uint8_t pt, uint8_t key_byte) {
     uint8_t v = gf_mix(pt, key_byte);   /* gf_mix is self-inverse (XOR) */
-    v = CR_INV[v];                       /* inverse nibble_step            */
-    v = NS_INV[v];                       /* inverse cond_rotate            */
+    v = ror8(v);                       /* inverse cond_rotate            */
+    v = NS_INV[v];                       /* inverse nibble_step          */
     v = BP_INV[v];                       /* inverse bit_permute            */
     return v;
 }
+/*
+static uint8_t solve_ciphertext_byte1(uint8_t plaintext_byte1) {
+    int c;
+
+    for (c = 0; c < 256; c++) {
+        uint8_t candidate = (uint8_t)c;
+
+        if (decrypt_byte(candidate, candidate) == plaintext_byte1)
+            return candidate;
+    }
+
+    fprintf(stderr, "Error - could not solve ciphertext byte 1\n");
+    exit(1);
+}
+    */
+
 
 /*
  * Self-test: run before touching any file.
@@ -340,9 +391,19 @@ int main(int argc, char *argv[]) {
             (argc > 0 ? argv[0] : "encryptor"));
         return 1;
     }
+
+    build_bp_inverse();
+    build_ns_inverse();
+
+printf("bit_permute(0x67) = 0x%02x\n", bit_permute(0x67));
+printf("nibble_step(0xB5) = 0x%02x\n", nibble_step(0xB5));
+printf("cond_rotate(0x5B) = 0x%02x\n", cond_rotate(0x5B));
+printf("gf_mix(0xB6, 0xED) = 0x%02x\n", gf_mix(0xB6, 0xED));
+
     if (!self_test()) {
     fprintf(stderr, "Error - cipher self-test failed\n");
     return 1;
+    }
 
         /* Open and size the input file                                         */
         fin = fopen(argv[1], "rb");
@@ -435,17 +496,31 @@ int main(int argc, char *argv[]) {
     /* Decrypt loop runs over [0..N+15], fwrite emits first N bytes only.  */
     /*                                                                      */
     /* Key selection per ciphertext byte (position i, 0-based):           */
-    /*   even i: ks[0]  = key[0]   */
-    /*   odd  i: ks[31] = key[31]   */
-  
-/* First 16-byte header/state */
+    /*   If (i & 2) == 0, Decrypt.exe uses state[1].   */
+    /*   If (i & 2) != 0, Decrypt.exe uses state[30].   */
+
+    /* Encrypted plaintext plus 16 encrypted filler bytes */
+    /*
+for (i = 0; i < (size_t)fsize + 16; i++) {
+    uint8_t key_byte = (i & 2) ? key[30] : key[1];
+    uint8_t pt = (i < (size_t)fsize) ? plaintext[i] : 0x00;
+    uint8_t ct = encrypt_byte(pt, key_byte);
+
+    if (fwrite(&ct, 1, 1, fout) != 1) {
+        fprintf(stderr, "Error - Write failed at encrypted byte %zu\n", i);
+        goto fail;
+    }
+}
+    */
+
+    /* First 16-byte header/state */
 if (fwrite(key, 1, 16, fout) != 16) {
     fprintf(stderr, "Error - Write failed (header)\n");
     goto fail;
 }
 
-    /* Encrypted plaintext plus 16 encrypted filler bytes */
-   for (i = 0; i < (size_t)fsize; i++) {
+/* Encrypted plaintext bytes */
+for (i = 0; i < (size_t)fsize; i++) {
     uint8_t key_byte = (i & 2) ? key[30] : key[1];
     uint8_t ct = encrypt_byte(plaintext[i], key_byte);
 
@@ -467,11 +542,62 @@ if (fwrite(key, 1, 16, fout) != 16) {
     fprintf(stdout,
         "Encrypted: %s  ->  %s\n"
         "  Plaintext : %ld bytes\n"
-        "  Ciphertext: %ld bytes  (+32 byte header/footer)\n"
-        "  Key[0]=0x%02x  Key[31]=0x%02x  [SHA-256(\"%s\")]\n",
+        "  Encrypted file: %ld bytes  (+16 header +16 trailer)\n"
+        "  Key[1]=0x%02x  Key[30]=0x%02x  [SHA-256(\"%s\")]\n",
         argv[1], outname,
         fsize, fsize + 32,
         key[1], key[30], argv[1]);
+
+        /* DEBUG: locally decrypt the generated .enc payload */
+
+/* DEBUG: locally decrypt the generated .enc payload */
+{
+    FILE *debug = fopen(outname, "rb");
+
+    if (debug) {
+        long enc_size;
+        uint8_t *encbuf;
+        size_t j;
+
+        fseek(debug, 0, SEEK_END);
+        enc_size = ftell(debug);
+        rewind(debug);
+
+        encbuf = (uint8_t *)malloc((size_t)enc_size);
+        if (!encbuf) {
+            fclose(debug);
+            fprintf(stderr, "DEBUG malloc failed\n");
+        } else {
+            fread(encbuf, 1, (size_t)enc_size, debug);
+            fclose(debug);
+
+            fprintf(stdout, "\nDEBUG local decrypt from offset 16:\n");
+
+            for (j = 0; j < (size_t)fsize; j++) {
+                uint8_t key_byte = (j & 2) ? encbuf[enc_size - 2] : encbuf[1];
+                uint8_t dec = decrypt_byte(encbuf[16 + j], key_byte);
+                fputc(dec, stdout);
+            }
+
+            fprintf(stdout, "\n");
+
+            fprintf(stdout, "\nDEBUG local decrypt from offset 0:\n");
+
+            for (j = 0; j < (size_t)fsize; j++) {
+                uint8_t key_byte = (j & 2) ? encbuf[enc_size - 2] : encbuf[1];
+                uint8_t dec = decrypt_byte(encbuf[j], key_byte);
+                fputc(dec, stdout);
+            }
+
+            fprintf(stdout, "\n");
+
+            free(encbuf);
+        }
+    } else {
+        fprintf(stderr, "DEBUG could not reopen %s\n", outname);
+    }
+}
+
 
     return 0;
 
