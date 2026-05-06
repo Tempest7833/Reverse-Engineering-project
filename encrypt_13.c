@@ -331,7 +331,7 @@ int main(int argc, char *argv[]) {
     size_t   base;
 
         /* Argument check                                                       */
-        if (argc < 2) {
+        if (argc < 3) {
         fprintf(stderr,
             "\n\nTo Encrypt: ENTER \"filename\" \"password\"\n"
             "\t%s filename password\n\n"
@@ -406,7 +406,7 @@ printf("gf_mix(0xB6, 0xED) = 0x%02x\n", gf_mix(0xB6, 0xED));
     /* it never re-derives it.  So we are free to choose any derivation   */
     /* we like.  The assignment specifies the key comes from the password  */
     /* passed on the command line.                                          */
-        sha256_string(argv[1], key);
+        sha256_string(argv[2], key);
 
         /* Build output filename: append .enc to the full input filename      */
         base = strlen(argv[1]);
@@ -491,10 +491,10 @@ for (i = 0; i < (size_t)fsize; i++) {
         "Encrypted: %s  ->  %s\n"
         "  Plaintext : %ld bytes\n"
         "  Encrypted file: %ld bytes  (+16 header +16 trailer)\n"
-        "  Key[1]=0x%02x  Key[30]=0x%02x  [SHA-256(\"%s\")]\n",
+        "  Key[1]=0x%02x  Key[30]=0x%02x  [SHA-256(password) embedded]\n",
         argv[1], outname,
         fsize, fsize + 32,
-        key[1], key[30], argv[1]);
+        key[1], key[30]);
 
         /* DEBUG: locally decrypt the generated .enc payload */
 
